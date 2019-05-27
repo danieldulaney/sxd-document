@@ -44,221 +44,21 @@ trait WriteStr: Write {
 
 impl<W: ?Sized> WriteStr for W where W: Write {}
 
-// TODO: Duplicating the String seems inefficient...
-struct PrefixScope<'d> {
-    ns_to_prefix: LazyHashMap<&'d str, String>,
-    prefix_to_ns: LazyHashMap<String, &'d str>,
-    defined_prefixes: Vec<(String, &'d str)>,
-    default_namespace_uri: Option<&'d str>,
+struct ElementStackFrame<'d> {
+    element: dom::Element<'d>,
+    autons: LazyHashMap<&'d str, i32>,
 }
 
-impl<'d> PrefixScope<'d> {
-    fn new() -> PrefixScope<'d> {
-        PrefixScope {
-            ns_to_prefix: LazyHashMap::new(),
-            prefix_to_ns: LazyHashMap::new(),
-            defined_prefixes: Vec::new(),
-            default_namespace_uri: None,
+impl<'d> From<dom::Element<'d>> for ElementStackFrame<'d> {
+    fn from(el: dom::Element<'d>) -> Self {
+        Self {
+            element: el,
+            autons: LazyHashMap::new(),
         }
-    }
-
-    fn has_prefix(&self, prefix: &str) -> bool {
-        self.prefix_to_ns.contains_key(prefix)
-    }
-
-    fn has_namespace_uri(&self, namespace_uri: &str) -> bool {
-        self.ns_to_prefix.contains_key(namespace_uri)
-    }
-
-    fn prefix_is(&self, prefix: &str, namespace_uri: &str) -> bool {
-        match self.prefix_to_ns.get(prefix) {
-            Some(ns) => *ns == namespace_uri,
-            _ => false,
-        }
-    }
-
-    fn namespace_uri_for(&self, prefix: &str) -> Option<&'d str> {
-        self.prefix_to_ns.get(prefix).map(|&ns| ns)
-    }
-
-    fn prefix_for(&self, namespace_uri: &str) -> Option<&str> {
-        self.ns_to_prefix.get(namespace_uri).map(|p| &p[..])
-    }
-
-    fn add_mapping(&mut self, prefix: &str, namespace_uri: &'d str) {
-        let prefix = prefix.to_owned();
-
-        self.prefix_to_ns.insert(prefix.clone(), namespace_uri);
-        self.ns_to_prefix.insert(namespace_uri, prefix);
-    }
-
-    fn define_prefix(&mut self, prefix: String, namespace_uri: &'d str) {
-        self.defined_prefixes.push((prefix, namespace_uri));
     }
 }
 
-enum NamespaceType<'a> {
-    Default,
-    Prefix(&'a str),
-    Unknown,
-}
-
-struct PrefixMapping<'d> {
-    scopes: Vec<PrefixScope<'d>>,
-    generated_prefix_count: usize,
-}
-
-impl<'d> PrefixMapping<'d> {
-    fn new() -> PrefixMapping<'d> {
-        PrefixMapping {
-            scopes: vec![PrefixScope::new()],
-            generated_prefix_count: 0,
-        }
-    }
-
-    fn push_scope(&mut self) {
-        self.scopes.push(PrefixScope::new());
-    }
-
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn active_default_namespace_uri(&self) -> Option<&'d str> {
-        self.scopes.iter().rev().filter_map(|s| s.default_namespace_uri).next()
-    }
-
-    fn active_namespace_uri_for_prefix(&self, prefix: &str) -> Option<&'d str> {
-        self.scopes.iter().rev().filter_map(|s| s.namespace_uri_for(prefix)).next()
-    }
-
-    fn default_namespace_uri_in_current_scope(&self) -> Option<&'d str> {
-        self.scopes.last().unwrap().default_namespace_uri
-    }
-
-    fn prefixes_in_current_scope(&self) -> slice::Iter<(String, &'d str)> {
-        self.scopes.last().unwrap().defined_prefixes.iter()
-    }
-
-    fn populate_scope(&mut self, element: &dom::Element<'d>, attributes: &[dom::Attribute<'d>]) {
-        self.scopes.last_mut().unwrap().default_namespace_uri = element.default_namespace_uri();
-
-        if let Some(prefix) = element.preferred_prefix() {
-            let name = element.name();
-            if let Some(uri) = name.namespace_uri {
-                self.set_prefix(prefix, uri);
-            }
-        }
-
-        for attribute in attributes.iter() {
-            if let Some(prefix) = attribute.preferred_prefix() {
-                let name = attribute.name();
-                if let Some(uri) = name.namespace_uri {
-                    self.set_prefix(prefix, uri);
-                }
-            }
-        }
-
-        let name = element.name();
-        if let Some(uri) = name.namespace_uri {
-            self.generate_prefix(uri);
-        }
-
-        for attribute in attributes.iter() {
-            let name = attribute.name();
-            if let Some(uri) = name.namespace_uri {
-                self.generate_prefix(uri);
-            }
-        }
-    }
-
-    fn set_prefix(&mut self, prefix: &str, namespace_uri: &'d str) {
-        let idx_of_last = self.scopes.len().saturating_sub(1);
-        let (parents, current_scope) = self.scopes.split_at_mut(idx_of_last);
-        let current_scope = &mut current_scope[0];
-
-        // If we're already using this prefix, we can't redefine it.
-        if current_scope.has_prefix(prefix) {
-            return;
-        }
-
-        // We are definitely going to use this prefix, claim it
-        current_scope.add_mapping(prefix, namespace_uri);
-
-        for parent_scope in parents.iter().rev() {
-            if parent_scope.prefix_is(prefix, namespace_uri) {
-                // A parent defines it as the URI we want.
-                // Prevent redefining it
-                return;
-            }
-        }
-
-        // Defined by us, must be added to the element
-        current_scope.define_prefix(prefix.to_owned(), namespace_uri);
-    }
-
-    fn generate_prefix(&mut self, namespace_uri: &'d str) {
-        if Some(namespace_uri) == self.active_default_namespace_uri() {
-            // We already map this namespace to the default
-            return;
-        }
-
-        let idx_of_last = self.scopes.len().saturating_sub(1);
-        let (parents, current_scope) = self.scopes.split_at_mut(idx_of_last);
-        let current_scope = &mut current_scope[0];
-
-        if current_scope.has_namespace_uri(namespace_uri) {
-            // We already map this namespace to *some* prefix
-            return;
-        }
-
-        // Check if the parent already defined a prefix for this ns
-        for parent_scope in parents.iter().rev() {
-            if let Some(prefix) = parent_scope.prefix_for(namespace_uri) {
-                // A parent happens to have a prefix for this URI.
-                // Prevent redefining it
-                current_scope.add_mapping(prefix, namespace_uri);
-                return;
-            }
-        }
-
-        loop {
-            let prefix = format!("autons{}", self.generated_prefix_count);
-            self.generated_prefix_count += 1;
-
-            if ! current_scope.has_prefix(&prefix) {
-                current_scope.add_mapping(&prefix, namespace_uri);
-                current_scope.define_prefix(prefix, namespace_uri);
-                break;
-            }
-        }
-    }
-
-    fn namespace_type<'a>(&'a self,
-                          preferred_prefix: Option<&'a str>,
-                          namespace_uri: &str,
-                          ignore_default: bool)
-                          -> NamespaceType<'a>
-    {
-        if !ignore_default && Some(namespace_uri) == self.active_default_namespace_uri() {
-            return NamespaceType::Default;
-        }
-
-        if let Some(prefix) = preferred_prefix {
-            if Some(namespace_uri) == self.active_namespace_uri_for_prefix(prefix) {
-                return NamespaceType::Prefix(prefix);
-            }
-        }
-
-        for scope in self.scopes.iter().rev() {
-            if let Some(prefix) = scope.prefix_for(namespace_uri) {
-                return NamespaceType::Prefix(prefix);
-            }
-        }
-
-        NamespaceType::Unknown
-    }
-}
+type ElementStack<'d> = Vec<ElementStackFrame<'d>>;
 
 enum Content<'d> {
     Element(dom::Element<'d>),
@@ -334,30 +134,12 @@ impl Writer {
 impl Writer {
     fn format_qname<'d, W: ?Sized>(&self,
                                    q: QName<'d>,
-                                   mapping: &mut PrefixMapping<'d>,
-                                   preferred_prefix: Option<&str>,
-                                   ignore_default: bool,
+                                   stack: &ElementStack<'d>,
                                    writer: &mut W)
                                    -> io::Result<()>
         where W: Write
     {
-        // Can something without a namespace be prefixed? No, because
-        // defining a prefix requires a non-empty URI
-        if let Some(namespace_uri) = q.namespace_uri {
-            match mapping.namespace_type(preferred_prefix, namespace_uri, ignore_default) {
-                NamespaceType::Default => {
-                    // No need to do anything
-                },
-                NamespaceType::Prefix(prefix) => {
-                    try!(writer.write_str(prefix));
-                    try!(writer.write_str(":"));
-                },
-                NamespaceType::Unknown => {
-                    panic!("No namespace prefix available for {}", namespace_uri);
-                },
-            }
-        }
-        writer.write_str(q.local_part)
+        writer.write(q.local_part().as_bytes()).map(|_| ())
     }
 
     fn format_attribute_value<W: ?Sized>(&self, value: &str, writer: &mut W) -> io::Result<()>
@@ -378,73 +160,53 @@ impl Writer {
     }
 
     fn format_element<'d, W: ?Sized>(&self,
-                                     element: dom::Element<'d>,
-                                     todo: &mut Vec<Content<'d>>,
-                                     mapping: &mut PrefixMapping<'d>,
+                                     stack: &mut ElementStack<'d>,
                                      writer: &mut W)
                                      -> io::Result<()>
         where W: Write
     {
+        let element = stack.last().expect("format_element called with empty stack").element;
         let attrs = element.attributes();
 
-        mapping.populate_scope(&element, &attrs);
-
         try!(writer.write_str("<"));
-        try!(self.format_qname(element.name(), mapping, element.preferred_prefix(), false, writer));
+        try!(self.format_qname(element.name(), stack, writer));
 
         for attr in &attrs {
             try!(writer.write_str(" "));
-            try!(self.format_qname(attr.name(), mapping, attr.preferred_prefix(), true, writer));
+            try!(self.format_qname(attr.name(), stack, writer));
             try!(write!(writer, "="));
             try!(write!(writer, "{}", self.quote_char()));
             try!(self.format_attribute_value(attr.value(), writer));
             try!(write!(writer, "{}", self.quote_char()));
         }
 
-        if let Some(ns_uri) = mapping.default_namespace_uri_in_current_scope() {
-            try!(writer.write_str(" xmlns='"));
-            try!(writer.write_str(ns_uri));
-            try!(writer.write_str("'"));
-        }
-
-        for &(ref prefix, ref ns_uri) in mapping.prefixes_in_current_scope() {
-            try!(writer.write_str(" xmlns:"));
-            try!(writer.write_str(prefix));
-            try!(write!(writer, "='{}'", ns_uri));
-        }
-
         let mut children = element.children();
         if children.is_empty() {
             try!(writer.write_str("/>"));
-            mapping.pop_scope();
-            Ok(())
         } else {
             try!(writer.write_str(">"));
 
-            todo.push(ElementEnd(element));
             children.reverse();
-            let x = children.into_iter().map(|c| match c {
-                ChildOfElement::Element(element)         => Element(element),
-                ChildOfElement::Text(t)                  => Text(t),
-                ChildOfElement::Comment(c)               => Comment(c),
-                ChildOfElement::ProcessingInstruction(p) => ProcessingInstruction(p),
-            });
-            todo.extend(x);
+            for child in children.into_iter() {
+                try!(match child {
+                    ChildOfElement::Element(e) => {
+                        stack.push(e.into());
+                        self.format_element(stack, writer)
+                    },
+                    ChildOfElement::Text(t) => self.format_text(t, writer),
+                    ChildOfElement::Comment(c) => self.format_comment(c, writer),
+                    ChildOfElement::ProcessingInstruction(p) => self.format_processing_instruction(p, writer),
+                })
+            }
 
-            Ok(())
+            try!(writer.write_str("</"));
+            try!(self.format_qname(element.name(), stack, writer));
+            try!(writer.write_str(">"));
         }
-    }
 
-    fn format_element_end<'d, W: ?Sized>(&self,
-                                         element: dom::Element<'d>,
-                                         mapping: &mut PrefixMapping<'d>,
-                                         writer: &mut W)
-                                         -> io::Result<()>
-        where W: Write
-    {
-        try!(writer.write_str("</"));
-        try!(self.format_qname(element.name(), mapping, element.preferred_prefix(), false, writer));
-        writer.write_str(">")
+        stack.pop();
+
+        Ok(())
     }
 
     fn format_text<W: ?Sized>(&self, text: dom::Text, writer: &mut W) -> io::Result<()>
@@ -478,39 +240,13 @@ impl Writer {
         }
     }
 
-    fn format_one<'d, W: ?Sized>(&self,
-                                 content: Content<'d>,
-                                 todo: &mut Vec<Content<'d>>,
-                                 mapping: &mut PrefixMapping<'d>,
-                                 writer: &mut W)
-                                 -> io::Result<()>
-        where W: Write
-    {
-        match content {
-            Element(e) => {
-                mapping.push_scope();
-                self.format_element(e, todo, mapping, writer)
-            },
-            ElementEnd(e) => {
-                let r = self.format_element_end(e, mapping, writer);
-                mapping.pop_scope();
-                r
-            },
-            Text(t) => self.format_text(t, writer),
-            Comment(c) => self.format_comment(c, writer),
-            ProcessingInstruction(p) => self.format_processing_instruction(p, writer),
-        }
-    }
-
     fn format_body<W: ?Sized>(&self, element: dom::Element, writer: &mut W) -> io::Result<()>
         where W: Write
     {
-        let mut todo = vec![Element(element)];
-        let mut mapping = PrefixMapping::new();
+        let mut stack: ElementStack = ElementStack::new();
+        stack.push(element.into());
 
-        while ! todo.is_empty() {
-            try!(self.format_one(todo.pop().unwrap(), &mut todo, &mut mapping, writer));
-        }
+        try!(self.format_element(&mut stack, writer));
 
         Ok(())
     }
