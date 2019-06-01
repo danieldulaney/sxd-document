@@ -25,6 +25,7 @@
 use std::borrow::ToOwned;
 use std::io::{self,Write};
 use std::slice;
+use std::cmp::max;
 
 use self::Content::*;
 
@@ -133,13 +134,47 @@ impl Writer {
 
 impl Writer {
     fn format_qname<'d, W: ?Sized>(&self,
-                                   q: QName<'d>,
-                                   stack: &ElementStack<'d>,
+                                   qname: QName<'d>,
+                                   stack: &mut ElementStack<'d>,
+                                   preferred_prefix: Option<&'d str>,
                                    writer: &mut W)
                                    -> io::Result<()>
         where W: Write
     {
-        writer.write(q.local_part().as_bytes()).map(|_| ())
+        if let Some(ns) = qname.namespace_uri() {
+            let element = stack.last().expect("called format_qname with an empty stack").element;
+
+            if element.recursive_default_namespace_uri() == Some(ns) {
+                // Don't do anything -- we're using the default namespace
+            } else if let Some(prefix) = element.prefix_for_namespace_uri(ns, preferred_prefix) {
+                // A prefix was defined -- use that prefix
+                try!(write!(writer, "{}:", prefix));
+            } else {
+                // We need to find or create an autons
+                // Work up the stack: If we find a matching autons, use it
+                // If we don't find a matching autons, define a new one
+                let mut max_autons: i32 = -1;
+                let mut autons_to_use: Option<i32> = None;
+
+                for stack_frame in stack.iter().rev() {
+                    if let Some(autons) = stack_frame.autons.get(ns) {
+                        autons_to_use = Some(*autons);
+                        break;
+                    } else {
+                        max_autons = max(max_autons, *stack_frame.autons.iter().map(|(_, v)| v).max().unwrap_or(&std::i32::MIN));
+                    }
+                }
+
+                if autons_to_use.is_none() {
+                    autons_to_use = Some(max_autons + 1);
+                    stack.last_mut().expect("called format_qname with an empty stack").autons.insert(ns, max_autons + 1);
+                }
+
+                try!(write!(writer, "autons{}:", autons_to_use.expect("was manually set if it was None")));
+            }
+        }
+
+        writer.write(qname.local_part().as_bytes()).map(|_| ())
     }
 
     fn format_attribute_value<W: ?Sized>(&self, value: &str, writer: &mut W) -> io::Result<()>
@@ -169,11 +204,11 @@ impl Writer {
         let attrs = element.attributes();
 
         try!(writer.write_str("<"));
-        try!(self.format_qname(element.name(), stack, writer));
+        try!(self.format_qname(element.name(), stack, element.preferred_prefix(), writer));
 
         for attr in &attrs {
             try!(writer.write_str(" "));
-            try!(self.format_qname(attr.name(), stack, writer));
+            try!(self.format_qname(attr.name(), stack, element.preferred_prefix(), writer));
             try!(write!(writer, "="));
             try!(write!(writer, "{}", self.quote_char()));
             try!(self.format_attribute_value(attr.value(), writer));
@@ -200,7 +235,7 @@ impl Writer {
             }
 
             try!(writer.write_str("</"));
-            try!(self.format_qname(element.name(), stack, writer));
+            try!(self.format_qname(element.name(), stack, element.preferred_prefix(), writer));
             try!(writer.write_str(">"));
         }
 
